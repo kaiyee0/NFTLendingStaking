@@ -28,7 +28,7 @@ contract NftFiLoanBank{
     }
 
     // Number of loans have been created
-    uint256 public numOfLoans;
+    uint256 public numOfLoans = 0;
 
     // Number of loans whose status are still being able to bid
     uint256 public numOfBiddableLoans;
@@ -96,14 +96,19 @@ contract NftFiLoanBank{
     }
 
     // Loan Status
-    // unbid : all loans will be init with status unbid when proposed
-    // bid   : when a loan is bid by a lender, the status will become bid
-    // end   : whenver a loan is expired from endingBidTimestamp, repaid or default
-    //         (cannot repay) by the borrower, the status will finally end.
+    // unbid     : all loans will be init with status unbid when proposed
+    // bid       : loan is bid by a lender, the status will become bid
+    // canceled  : the loan asker cancel the loan request
+    // expired   : loan's endingbidtimestamp is up
+    // repaid    : loan is repaid by the borrower
+    // defaulted : the borrower cannot repay in time, so the ownership of NFT would be transferred
     enum Status {
         unbid,
         bid,
-        end
+        canceled,
+        expired,
+        repaid,
+        defaulted
     }
 
     event LoanCreated(uint256 id, address tokenAddress, address tokenOwnerAddress, 
@@ -129,7 +134,8 @@ contract NftFiLoanBank{
     {
         require(_endingBidTimestamp > block.timestamp, "Loan bid ending time error.");
         uint256 loanID = numOfLoans ++;
-        IERC721(_tokenAddress).transferFrom(msg.sender, address(this), _tokenID);
+        transferNFTToUser(_tokenAddress, _tokenID, msg.sender, address(this));
+        // IERC721(_tokenAddress).transferFrom(msg.sender, address(this), _tokenID);
         Loans[loanID].ID = loanID;
         Loans[loanID].tokenAddress = _tokenAddress;
         Loans[loanID].tokenOwnerAddress = msg.sender;
@@ -158,10 +164,10 @@ contract NftFiLoanBank{
     {
         Loan storage loanToCancel = Loans[_id];
         require(msg.sender == loanToCancel.tokenOwnerAddress, "Only the loan asker can cancel the loan");
-        require(loanToCancel.status == Status.unbid);
+        require(loanToCancel.status == Status.unbid, "Loan status error : require unbid.");
         transferNFTToUser(loanToCancel.tokenAddress, loanToCancel.tokenID, address(this), 
                             loanToCancel.tokenOwnerAddress);
-        Loans[_id].status = Status.end;
+        Loans[_id].status = Status.canceled;
         numOfBiddableLoans -= 1;
         emit LoanCanceled(_id, msg.sender);
     }
@@ -180,10 +186,10 @@ contract NftFiLoanBank{
     {
         Loan storage loanToBid = Loans[_id];
         uint256 nowTimestamp = block.timestamp;
-        require(loanToBid.endingBidTimestamp > nowTimestamp);
+        require(loanToBid.endingBidTimestamp > nowTimestamp, "Do not have the permission to call function now");
         require(msg.value >= loanToBid.amount);
         bool sendSuccess = sendETHToUser(payable(loanToBid.tokenOwnerAddress), loanToBid.amount);
-        require(sendSuccess);
+        require(sendSuccess, "Fail during transaction");
         loanToBid.lenderAddress = msg.sender;
         loanToBid.status = Status.bid;
         loanToBid.initTimestamp = nowTimestamp;
@@ -207,11 +213,11 @@ contract NftFiLoanBank{
     function repayLoan(uint256 _id) external payable nonReentrant
     {
         Loan storage loanToRepay = Loans[_id];
-        require(msg.value >= loanToRepay.repayAmount);
-        require(block.timestamp < loanToRepay.endTimestamp);
+        require(msg.value >= loanToRepay.repayAmount, "Fail before transaction: value sent not enough");
+        require(block.timestamp < loanToRepay.endTimestamp, "Do not have the permission to call function now");
         bool sendSuccess = sendETHToUser(payable(loanToRepay.lenderAddress), loanToRepay.repayAmount);
-        require(sendSuccess);
-        loanToRepay.status = Status.end;
+        require(sendSuccess, "Fail during transaction");
+        loanToRepay.status = Status.repaid;
         emit LoanRepay(_id, msg.sender);
         updateLoanList(_id, loanToRepay.lenderAddress, loanToRepay.tokenOwnerAddress);
         transferNFTToUser(loanToRepay.tokenAddress, loanToRepay.tokenID, address(this), loanToRepay.tokenOwnerAddress);
@@ -333,6 +339,22 @@ contract NftFiLoanBank{
     }
 
     /**
+     * @dev Updates the status of exired loan by id. Called by the tokenOwner,
+     * i.e., loan request asker, and transder the ownership of NFT..
+     */
+    function updateExpiredLoanStatusByBorrower(uint256 _id) public
+    {
+        uint256 nowTimestamp = block.timestamp;
+        Loan storage loanIsExpired = Loans[_id];
+        require(loanIsExpired.status == Status.unbid, "Loan status error : require unbid.");
+        require(msg.sender == loanIsExpired.tokenOwnerAddress, "Do not have permission to call function");
+        require(nowTimestamp > loanIsExpired.endingBidTimestamp, "Do not have the permission to call function now");
+        loanIsExpired.status = Status.expired;
+        transferNFTToUser(loanIsExpired.tokenAddress, loanIsExpired.tokenID, address(this), 
+                                        loanIsExpired.tokenOwnerAddress);
+    }
+
+    /**
      * @dev Updates status for all the exired loan by their endingBidTimestamp.
      * 
      * TODO: For there is not any scheduler function for the blockchain, we can now only
@@ -348,7 +370,7 @@ contract NftFiLoanBank{
             {
                 if (Loans[i].endingBidTimestamp < nowTimestamp)
                 {
-                    Loans[i].status = Status.end;
+                    Loans[i].status = Status.expired;
                     transferNFTToUser(Loans[i].tokenAddress, Loans[i].tokenID, address(this), 
                                         Loans[i].tokenOwnerAddress);
                     expiredLoans ++;
@@ -356,6 +378,22 @@ contract NftFiLoanBank{
             }
         }
         numOfBiddableLoans -= expiredLoans;
+    }
+
+    /**
+     * @dev Updates the status of defaulted loan by id. Called by the lender
+     * and transder the ownership of NFT.
+     */
+    function updateDefaultedLoanStatusByLender(uint256 _id) public
+    {
+        uint256 nowTimestamp = block.timestamp;
+        Loan storage loanIsDefaulted = Loans[_id];
+        require(loanIsDefaulted.status == Status.bid, "Loan status error : require bid.");
+        require(msg.sender == loanIsDefaulted.lenderAddress, "Do not have permission to call function");
+        require(nowTimestamp > loanIsDefaulted.endTimestamp, "Do not have the permission to call function now");
+        loanIsDefaulted.status = Status.expired;
+        transferNFTToUser(loanIsDefaulted.tokenAddress, loanIsDefaulted.tokenID, address(this), 
+                                        loanIsDefaulted.lenderAddress);
     }
 
     /**
@@ -375,7 +413,7 @@ contract NftFiLoanBank{
             {
                 if (Loans[i].endTimestamp < nowTimestamp)
                 {
-                    Loans[i].status = Status.end;
+                    Loans[i].status = Status.defaulted;
                     transferNFTToUser(Loans[i].tokenAddress, Loans[i].tokenID, address(this), 
                                         Loans[i].lenderAddress);
                 }
